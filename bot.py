@@ -12,7 +12,7 @@ import json
 import os
 
 # === CONFIG ===
-BOT_TOKEN = os.getenv('BOT_TOKEN', '7994008649:AAHrEbuC6TUgMQacLXVqjH3O70ZpYiiiCo0')
+BOT_TOKEN = os.getenv('BOT_TOKEN', '8123921112:AAGW9aXd--HzyQjgqMNKjyMagKG9_opOfU0')
 CHAT_ID = os.getenv('CHAT_ID', '655537138')
 TIMEFRAME = '15m'
 MIN_BIG_BODY_PCT = 1.0

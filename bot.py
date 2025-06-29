@@ -279,6 +279,7 @@ def process_symbol(symbol, alert_queue):
                 f"{symbol} - RISING PATTERN\n"
                 f"Above 21 ema - {ema_status['price_ema21']}\n"
                 f"ema 9 above 21 - {ema_status['ema9_ema21']}\n"
+                geology = 'buy'
                 f"entry - {entry_price}\n"
                 f"tp - {big_candle_close}\n"
                 f"sl - {sl:.4f}\n"
@@ -339,38 +340,36 @@ def scan_loop():
     def send_alerts():
         while True:
             try:
-                # Collect all signals for the current scan cycle
+                # Wait for the scan cycle to complete (triggered by main loop)
                 signals = []
-                while True:
-                    try:
-                        signal = alert_queue.get(timeout=1)
-                        signals.append(signal)
-                        alert_queue.task_done()
-                    except queue.Empty:
-                        break
+                while not alert_queue.empty():
+                    signal = alert_queue.get()
+                    signals.append(signal)
+                    alert_queue.task_done()
 
-                # Check if we have >= 9 signals
-                if len(signals) >= 9:
-                    print(f"✅ Found {len(signals)} signals, executing trades...")
-                    for symbol, msg, ema_status, category in signals:
-                        mid = send_telegram(msg)
-                        if mid and symbol not in open_trades:
-                            trade = {
-                                'side': 'buy' if 'RISING' in msg else 'sell',
-                                'entry': float(msg.split('entry - ')[1].split('\n')[0]),
-                                'tp': float(msg.split('tp - ')[1].split('\n')[0]),
-                                'sl': float(msg.split('sl - ')[1].split('\n')[0]),
-                                'msg': msg,
-                                'msg_id': mid,
-                                'ema_status': ema_status,
-                                'category': category
-                            }
-                            open_trades[symbol] = trade
-                            save_trades()
-                else:
-                    print(f"⚠️ Only {len(signals)} signals found, skipping trades (need >= 9).")
-                    send_telegram(f"Scan completed, but only {len(signals)} signals found. Skipping trades (need >= 9).")
-
+                # Process signals only if scan cycle is complete (triggered externally)
+                if signals:  # Only process if signals were collected
+                    if len(signals) >= 9:
+                        print(f"✅ Found {len(signals)} signals, executing trades...")
+                        for symbol, msg, ema_status, category in signals:
+                            mid = send_telegram(msg)
+                            if mid and symbol not in open_trades:
+                                trade = {
+                                    'side': 'buy' if 'RISING' in msg else 'sell',
+                                    'entry': float(msg.split('entry - ')[1].split('\n')[0]),
+                                    'tp': float(msg.split('tp - ')[1].split('\n')[0]),
+                                    'sl': float(msg.split('sl - ')[1].split('\n')[0]),
+                                    'msg': msg,
+                                    'msg_id': mid,
+                                    'ema_status': ema_status,
+                                    'category': category
+                                }
+                                open_trades[symbol] = trade
+                                save_trades()
+                    else:
+                        print(f"⚠️ Only {len(signals)} signals found, skipping trades (need >= 9).")
+                        send_telegram(f"Scan completed at {get_ist_time().strftime('%I:%M %p IST, %B %d, %Y')}, but only {len(signals)} signals found. Skipping trades (need >= 9).")
+                time.sleep(1)  # Prevent tight loop
             except Exception as e:
                 print(f"Alert thread error: {e}")
                 time.sleep(1)
@@ -383,6 +382,11 @@ def scan_loop():
         wait_time = max(0, next_close - time.time())
         print(f"⏳ Waiting {wait_time:.1f} seconds for next 15m candle close...")
         time.sleep(wait_time)
+
+        # Clear alert queue before new scan to avoid stale signals
+        while not alert_queue.empty():
+            alert_queue.get()
+            alert_queue.task_done()
 
         for i, chunk in enumerate(symbol_chunks):
             print(f"Processing batch {i+1}/{NUM_CHUNKS}...")

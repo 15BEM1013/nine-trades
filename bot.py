@@ -245,6 +245,7 @@ def process_symbol(symbol, alert_queue):
         for attempt in range(3):
             candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=30)
             if len(candles) < 25:
+                print(f"No signal for {symbol}: Insufficient candles ({len(candles)} < 25)")
                 return
             if attempt < 2 and candles[-1][0] > candles[-2][0]:
                 break
@@ -253,6 +254,7 @@ def process_symbol(symbol, alert_queue):
         ema21 = calculate_ema(candles, period=21)
         ema9 = calculate_ema(candles, period=9)
         if ema21 is None or ema9 is None:
+            print(f"No signal for {symbol}: EMA calculation failed")
             return
 
         signal_time = candles[-2][0]
@@ -262,6 +264,7 @@ def process_symbol(symbol, alert_queue):
         if detect_rising_three(candles):
             sl = entry_price * (1 - 0.015)  # Fixed 1.5% SL
             if sent_signals.get((symbol, 'rising')) == signal_time:
+                print(f"No signal for {symbol}: Duplicate rising signal at {signal_time}")
                 return
             sent_signals[(symbol, 'rising')] = signal_time
             price_above_ema21 = entry_price > ema21
@@ -279,17 +282,18 @@ def process_symbol(symbol, alert_queue):
                 f"{symbol} - RISING PATTERN\n"
                 f"Above 21 ema - {ema_status['price_ema21']}\n"
                 f"ema 9 above 21 - {ema_status['ema9_ema21']}\n"
-                geology = 'buy'
                 f"entry - {entry_price}\n"
                 f"tp - {big_candle_close}\n"
                 f"sl - {sl:.4f}\n"
                 f"Trade going on..."
             )
+            print(f"Signal detected for {symbol}: Rising Three")
             alert_queue.put((symbol, msg, ema_status, category))
 
         elif detect_falling_three(candles):
             sl = entry_price * (1 + 0.015)  # Fixed 1.5% SL
             if sent_signals.get((symbol, 'falling')) == signal_time:
+                print(f"No signal for {symbol}: Duplicate falling signal at {signal_time}")
                 return
             sent_signals[(symbol, 'falling')] = signal_time
             price_below_ema21 = entry_price < ema21
@@ -312,9 +316,13 @@ def process_symbol(symbol, alert_queue):
                 f"sl - {sl:.4f}\n"
                 f"Trade going on..."
             )
+            print(f"Signal detected for {symbol}: Falling Three")
             alert_queue.put((symbol, msg, ema_status, category))
+        else:
+            print(f"No signal for {symbol}: No Rising or Falling Three pattern detected")
 
     except ccxt.RateLimitExceeded:
+        print(f"Rate limit exceeded for {symbol}, retrying after delay")
         time.sleep(5)
     except Exception as e:
         print(f"Error on {symbol}: {e}")

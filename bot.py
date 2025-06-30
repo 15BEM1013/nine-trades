@@ -26,7 +26,6 @@ SL_PCT = 1.0 / 100
 TP_SL_CHECK_INTERVAL = 30
 TRADE_FILE = 'open_trades.json'
 CLOSED_TRADE_FILE = 'closed_trades.json'
-SUMMARY_INTERVAL = 3600  # 1 hour in seconds
 
 # === PROXY ===
 proxies = {
@@ -114,7 +113,6 @@ app = Flask(__name__)
 sent_signals = {}
 open_trades = {}
 closed_trades = []
-last_summary_time = 0  # Track last summary time
 
 # === CANDLE HELPERS ===
 def is_bullish(c): return c[4] > c[1]
@@ -225,8 +223,8 @@ def check_tp_sl():
                             f"{'Above' if trade['side'] == 'buy' else 'Below'} 21 ema - {ema_status['price_ema21']}\n"
                             f"ema 9 {'above' if trade['side'] == 'buy' else 'below'} 21 - {ema_status['ema9_ema21']}\n"
                             f"entry - {trade['entry']}\n"
-                            f"tp - {trade['tp']}: {'✅' if 'TP' in hit else ''}\n"
-                            f"sl - {trade['sl']:.4f}: {'❌' if 'SL' in hit else ''}\n"
+                            f"tp - {trade['tp']}\n"
+                            f"sl - {trade['sl']:.4f}\n"
                             f"Profit/Loss: {pnl:.2f}% (${profit:.2f})\n{hit}"
                         )
                         edit_telegram_message(trade['msg_id'], new_msg)
@@ -245,7 +243,6 @@ def process_symbol(symbol, alert_queue):
         for attempt in range(3):
             candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=30)
             if len(candles) < 25:
-                print(f"No signal for {symbol}: Insufficient candles ({len(candles)} < 25)")
                 return
             if attempt < 2 and candles[-1][0] > candles[-2][0]:
                 break
@@ -254,17 +251,20 @@ def process_symbol(symbol, alert_queue):
         ema21 = calculate_ema(candles, period=21)
         ema9 = calculate_ema(candles, period=9)
         if ema21 is None or ema9 is None:
-            print(f"No signal for {symbol}: EMA calculation failed")
             return
 
         signal_time = candles[-2][0]
         entry_price = candles[-2][4]
         big_candle_close = candles[-4][4]
 
+        # Check if there are 9 or more open trades before processing
+        if len(open_trades) < 9:
+            print(f"Rejected trade for {symbol}: Only {len(open_trades)} open trades, need 9 or more.")
+            return
+
         if detect_rising_three(candles):
             sl = entry_price * (1 - 0.015)  # Fixed 1.5% SL
             if sent_signals.get((symbol, 'rising')) == signal_time:
-                print(f"No signal for {symbol}: Duplicate rising signal at {signal_time}")
                 return
             sent_signals[(symbol, 'rising')] = signal_time
             price_above_ema21 = entry_price > ema21
@@ -287,13 +287,11 @@ def process_symbol(symbol, alert_queue):
                 f"sl - {sl:.4f}\n"
                 f"Trade going on..."
             )
-            print(f"Signal detected for {symbol}: Rising Three")
             alert_queue.put((symbol, msg, ema_status, category))
 
         elif detect_falling_three(candles):
             sl = entry_price * (1 + 0.015)  # Fixed 1.5% SL
             if sent_signals.get((symbol, 'falling')) == signal_time:
-                print(f"No signal for {symbol}: Duplicate falling signal at {signal_time}")
                 return
             sent_signals[(symbol, 'falling')] = signal_time
             price_below_ema21 = entry_price < ema21
@@ -316,13 +314,9 @@ def process_symbol(symbol, alert_queue):
                 f"sl - {sl:.4f}\n"
                 f"Trade going on..."
             )
-            print(f"Signal detected for {symbol}: Falling Three")
             alert_queue.put((symbol, msg, ema_status, category))
-        else:
-            print(f"No signal for {symbol}: No Rising or Falling Three pattern detected")
 
     except ccxt.RateLimitExceeded:
-        print(f"Rate limit exceeded for {symbol}, retrying after delay")
         time.sleep(5)
     except Exception as e:
         print(f"Error on {symbol}: {e}")
@@ -336,7 +330,7 @@ def process_batch(symbols, alert_queue):
 
 # === SCAN LOOP ===
 def scan_loop():
-    global closed_trades, last_summary_time
+    global closed_trades
     load_trades()
     symbols = get_symbols()
     print(f"🔍 Scanning {len(symbols)} Binance Futures symbols...")
@@ -348,36 +342,24 @@ def scan_loop():
     def send_alerts():
         while True:
             try:
-                # Wait for the scan cycle to complete (triggered by main loop)
-                signals = []
-                while not alert_queue.empty():
-                    signal = alert_queue.get()
-                    signals.append(signal)
-                    alert_queue.task_done()
-
-                # Process signals only if scan cycle is complete (triggered externally)
-                if signals:  # Only process if signals were collected
-                    if len(signals) >= 9:
-                        print(f"✅ Found {len(signals)} signals, executing trades...")
-                        for symbol, msg, ema_status, category in signals:
-                            mid = send_telegram(msg)
-                            if mid and symbol not in open_trades:
-                                trade = {
-                                    'side': 'buy' if 'RISING' in msg else 'sell',
-                                    'entry': float(msg.split('entry - ')[1].split('\n')[0]),
-                                    'tp': float(msg.split('tp - ')[1].split('\n')[0]),
-                                    'sl': float(msg.split('sl - ')[1].split('\n')[0]),
-                                    'msg': msg,
-                                    'msg_id': mid,
-                                    'ema_status': ema_status,
-                                    'category': category
-                                }
-                                open_trades[symbol] = trade
-                                save_trades()
-                    else:
-                        print(f"⚠️ Only {len(signals)} signals found, skipping trades (need >= 9).")
-                        send_telegram(f"Scan completed at {get_ist_time().strftime('%I:%M %p IST, %B %d, %Y')}, but only {len(signals)} signals found. Skipping trades (need >= 9).")
-                time.sleep(1)  # Prevent tight loop
+                symbol, msg, ema_status, category = alert_queue.get(timeout=1)
+                mid = send_telegram(msg)
+                if mid and symbol not in open_trades:
+                    trade = {
+                        'side': 'buy' if 'RISING' in msg else 'sell',
+                        'entry': float(msg.split('entry - ')[1].split('\n')[0]),
+                        'tp': float(msg.split('tp - ')[1].split('\n')[0]),
+                        'sl': float(msg.split('sl - ')[1].split('\n')[0]),
+                        'msg': msg,
+                        'msg_id': mid,
+                        'ema_status': ema_status,
+                        'category': category
+                    }
+                    open_trades[symbol] = trade
+                    save_trades()
+                alert_queue.task_done()
+            except queue.Empty:
+                continue
             except Exception as e:
                 print(f"Alert thread error: {e}")
                 time.sleep(1)
@@ -391,11 +373,6 @@ def scan_loop():
         print(f"⏳ Waiting {wait_time:.1f} seconds for next 15m candle close...")
         time.sleep(wait_time)
 
-        # Clear alert queue before new scan to avoid stale signals
-        while not alert_queue.empty():
-            alert_queue.get()
-            alert_queue.task_done()
-
         for i, chunk in enumerate(symbol_chunks):
             print(f"Processing batch {i+1}/{NUM_CHUNKS}...")
             process_batch(chunk, alert_queue)
@@ -406,65 +383,63 @@ def scan_loop():
         num_open = len(open_trades)
         print(f"📊 Number of open trades: {num_open}")
 
-        # Check if it's time to send the hourly PnL summary
-        current_time = time.time()
-        if current_time - last_summary_time >= SUMMARY_INTERVAL:
-            # Load all closed trades for cumulative summary
-            all_closed_trades = load_closed_trades()
+        # Load all closed trades for cumulative summary
+        all_closed_trades = load_closed_trades()
 
-            # Compile PnL summary
-            two_green_trades = [t for t in all_closed_trades if t['category'] == 'two_green']
-            one_green_trades = [t for t in all_closed_trades if t['category'] == 'one_green_one_caution']
-            two_cautions_trades = [t for t in all_closed_trades if t['category'] == 'two_cautions']
+        # Compile PnL summary
+        two_green_trades = [t for t in all_closed_trades if t['category'] == 'two_green']
+        one_green_trades = [t for t in all_closed_trades if t['category'] == 'one_green_one_caution']
+        two_cautions_trades = [t for t in all_closed_trades if t['category'] == 'two_cautions']
 
-            # Calculate metrics for each category
-            def get_category_metrics(trades):
-                count = len(trades)
-                wins = sum(1 for t in trades if t['pnl'] > 0)
-                losses = sum(1 for t in trades if t['pnl'] < 0)
-                pnl = sum(t['pnl'] for t in trades)
-                pnl_pct = sum(t['pnl_pct'] for t in trades)
-                win_rate = (wins / count * 100) if count > 0 else 0.00
-                return count, wins, losses, pnl, pnl_pct, win_rate
+        # Calculate metrics for each category
+        def get_category_metrics(trades):
+            count = len(trades)
+            wins = sum(1 for t in trades if t['pnl'] > 0)
+            losses = sum(1 for t in trades if t['pnl'] < 0)
+            pnl = sum(t['pnl'] for t in trades)
+            pnl_pct = sum(t['pnl_pct'] for t in trades)
+            win_rate = (wins / count * 100) if count > 0 else 0.00
+            return count, wins, losses, pnl, pnl_pct, win_rate
 
-            two_green_count, two_green_wins, two_green_losses, two_green_pnl, two_green_pnl_pct, two_green_win_rate = get_category_metrics(two_green_trades)
-            one_green_count, one_green_wins, one_green_losses, one_green_pnl, one_green_pnl_pct, one_green_win_rate = get_category_metrics(one_green_trades)
-            two_cautions_count, two_cautions_wins, two_cautions_losses, two_cautions_pnl, two_cautions_pnl_pct, two_cautions_win_rate = get_category_metrics(two_cautions_trades)
+        two_green_count, two_green_wins, two_green_losses, two_green_pnl, two_green_pnl_pct, two_green_win_rate = get_category_metrics(two_green_trades)
+        one_green_count, one_green_wins, one_green_losses, one_green_pnl, one_green_pnl_pct, one_green_win_rate = get_category_metrics(one_green_trades)
+        two_cautions_count, two_cautions_wins, two_cautions_losses, two_cautions_pnl, two_cautions_pnl_pct, two_cautions_win_rate = get_category_metrics(two_cautions_trades)
 
-            total_pnl = two_green_pnl + one_green_pnl + two_cautions_pnl
-            total_pnl_pct = two_green_pnl_pct + one_green_pnl_pct + two_cautions_pnl_pct
-            cumulative_pnl = total_pnl
-            cumulative_pnl_pct = total_pnl_pct
+        total_pnl = two_green_pnl + one_green_pnl + two_cautions_pnl
+        total_pnl_pct = two_green_pnl_pct + one_green_pnl_pct + two_cautions_pnl_pct
+        cumulative_pnl = total_pnl
+        cumulative_pnl_pct = total_pnl_pct
 
-            # Find top symbol
-            if all_closed_trades:
-                symbol_pnl = {}
-                for trade in all_closed_trades:
-                    sym = trade['symbol']
-                    symbol_pnl[sym] = symbol_pnl.get(sym, 0) + trade['pnl']
-                top_symbol = max(symbol_pnl.items(), key=lambda x: x[1], default=(None, 0))
-                top_symbol_name, top_symbol_pnl = top_symbol
-                top_symbol_pnl_pct = sum(t['pnl_pct'] for t in all_closed_trades if t['symbol'] == top_symbol_name)
-            else:
-                top_symbol_name, top_symbol_pnl, top_symbol_pnl_pct = None, 0, 0
+        # Find top symbol
+        if all_closed_trades:
+            symbol_pnl = {}
+            for trade in all_closed_trades:
+                sym = trade['symbol']
+                symbol_pnl[sym] = symbol_pnl.get(sym, 0) + trade['pnl']
+            top_symbol = max(symbol_pnl.items(), key=lambda x: x[1], default=(None, 0))
+            top_symbol_name, top_symbol_pnl = top_symbol
+            top_symbol_pnl_pct = sum(t['pnl_pct'] for t in all_closed_trades if t['symbol'] == top_symbol_name)
+        else:
+            top_symbol_name, top_symbol_pnl, top_symbol_pnl_pct = None, 0, 0
 
-            # Format Telegram message
-            timestamp = get_ist_time().strftime("%I:%M %p IST, %B %d, %Y")
-            summary_msg = (
-                f"🔍 Hourly Scan Summary at {timestamp}\n"
-                f"📊 Trade Summary (Closed Trades):\n"
-                f"- ✅✅ Two Green Ticks: {two_green_count} trades (Wins: {two_green_wins}, Losses: {two_green_losses}), PnL: ${two_green_pnl:.2f} ({two_green_pnl_pct:.2f}%), Win Rate: {two_green_win_rate:.2f}%\n"
-                f"- ✅⚠️ One Green, One Caution: {one_green_count} trades (Wins: {one_green_wins}, Losses: {one_green_losses}), PnL: ${one_green_pnl:.2f} ({one_green_pnl_pct:.2f}%), Win Rate: {one_green_win_rate:.2f}%\n"
-                f"- ⚠️⚠️ Two Cautions: {two_cautions_count} trades (Wins: {two_cautions_wins}, Losses: {two_cautions_losses}), PnL: ${two_cautions_pnl:.2f} ({two_cautions_pnl_pct:.2f}%), Win Rate: {two_cautions_win_rate:.2f}%\n"
-                f"💰 Total PnL: ${total_pnl:.2f} ({total_pnl_pct:.2f}%)\n"
-                f"📈 Cumulative PnL: ${cumulative_pnl:.2f} ({cumulative_pnl_pct:.2f}%)\n"
-                f"🏆 Top Symbol: {top_symbol_name or 'None'} with ${top_symbol_pnl:.2f} ({top_symbol_pnl_pct:.2f}%)\n"
-                f"🔄 Open Trades: {num_open}"
-            )
-            send_telegram(summary_msg)
-            send_telegram(f"Number of open trades after scan: {num_open}")
-            last_summary_time = current_time
-            closed_trades = []  # Reset closed_trades after summary
+        # Format Telegram message
+        timestamp = get_ist_time().strftime("%I:%M %p IST, %B %d, %Y")
+        summary_msg = (
+            f"🔍 Scan Completed at {timestamp}\n"
+            f"📊 Trade Summary (Closed Trades):\n"
+            f"- ✅✅ Two Green Ticks: {two_green_count} trades (Wins: {two_green_wins}, Losses: {two_green_losses}), PnL: ${two_green_pnl:.2f} ({two_green_pnl_pct:.2f}%), Win Rate: {two_green_win_rate:.2f}%\n"
+            f"- ✅⚠️ One Green, One Caution: {one_green_count} trades (Wins: {one_green_wins}, Losses: {one_green_losses}), PnL: ${one_green_pnl:.2f} ({one_green_pnl_pct:.2f}%), Win Rate: {one_green_win_rate:.2f}%\n"
+            f"- ⚠️⚠️ Two Cautions: {two_cautions_count} trades (Wins: {two_cautions_wins}, Losses: {two_cautions_losses}), PnL: ${two_cautions_pnl:.2f} ({two_cautions_pnl_pct:.2f}%), Win Rate: {two_cautions_win_rate:.2f}%\n"
+            f"💰 Total PnL: ${total_pnl:.2f} ({total_pnl_pct:.2f}%)\n"
+            f"📈 Cumulative PnL: ${cumulative_pnl:.2f} ({cumulative_pnl_pct:.2f}%)\n"
+            f"🏆 Top Symbol: {top_symbol_name or 'None'} with ${top_symbol_pnl:.2f} ({top_symbol_pnl_pct:.2f}%)\n"
+            f"🔄 Open Trades: {num_open}"
+        )
+        send_telegram(summary_msg)
+        send_telegram(f"Number of open trades after scan: {num_open}")
+
+        # Reset closed_trades after generating the summary
+        closed_trades = []
 
 # === FLASK ===
 @app.route('/')

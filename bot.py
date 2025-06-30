@@ -337,19 +337,23 @@ def scan_loop():
     def send_alerts():
         while True:
             try:
-                # Collect all potential trades for the scan cycle
+                # Collect trades for the current cycle
                 cycle_trades = []
-                while True:
+                cycle_start = time.time()
+                while time.time() - cycle_start < 30:  # Allow up to 30 seconds to collect trades
                     try:
                         trade = alert_queue.get(timeout=1)
                         cycle_trades.append(trade)
                         alert_queue.task_done()
                     except queue.Empty:
-                        break
+                        continue
+
+                # Log detected trades
+                print(f"Cycle detected {len(cycle_trades)} trades: {[trade[0] for trade in cycle_trades]}")
 
                 # Process trades only if more than 9 are detected
                 if len(cycle_trades) > 9:
-                    print(f"✅ {len(cycle_trades)} trades detected in cycle, processing trades...")
+                    print(f"✅ Processing {len(cycle_trades)} trades...")
                     for symbol, msg, ema_status, category, side, entry, tp, sl in cycle_trades:
                         try:
                             mid = send_telegram(msg)
@@ -366,11 +370,12 @@ def scan_loop():
                                 }
                                 open_trades[symbol] = trade
                                 save_trades()
+                            else:
+                                print(f"Skipped trade for {symbol}: Already in open_trades or Telegram failed")
                         except Exception as e:
                             print(f"Error processing trade for {symbol}: {e}")
                 else:
-                    print(f"⚠️ Only {len(cycle_trades)} trades detected in cycle, ignoring all trades.")
-
+                    print(f"⚠️ Ignoring {len(cycle_trades)} trades (threshold not met)")
             except Exception as e:
                 print(f"Alert thread error: {e}")
                 time.sleep(1)
